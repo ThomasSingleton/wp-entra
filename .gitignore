@@ -2,3 +2,6 @@
 /Settings.*.json
 !/Settings.template.json
 .idea
+
+# Build artifacts
+/dist/
