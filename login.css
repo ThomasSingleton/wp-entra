@@ -3,6 +3,23 @@
 	padding: 20px 0px 30px 0px;
 }
 
+.aadsso-login-form-text .submit {
+	text-align: center;
+}
+
+.aadsso-login-form-text .aadsso-login-button {
+	width: 100%;
+	text-align: center;
+	text-decoration: none;
+	box-sizing: border-box;
+	display: block;
+}
+
+.aadsso-signout-text {
+	text-align: center;
+	margin-top: 0;
+}
+
 .aadsso-login-form-text a.dim, 
 .aadsso-login-form-text a.dim:visited, 
 .aadsso-login-form-text a.dim:active, 

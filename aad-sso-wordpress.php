@@ -4,9 +4,9 @@
 Plugin Name: Single Sign-on with Microsoft Entra ID
 Plugin URI: http://github.com/psignoret/aad-sso-wordpress
 Description: Allows you to use your organization's Microsoft Entra ID (formerly known as Azure Active Directory) user accounts to log in to WordPress. If your organization is using Office 365, your user accounts are already in Microsoft Entra ID. This plugin uses OAuth 2.0 to authenticate users, and the Microsoft Graph API to get group membership and other details.
-Author: Philippe Signoret
-Version: 0.7.1
-Author URI: https://www.psignoret.com/
+Author: Thomas Singleton
+Version: 0.7.2
+Author URI: https://solitarytech.com.au/
 Text Domain: aad-sso-wordpress
 Domain Path: /languages/
 */
@@ -75,6 +75,17 @@ class AADSSO {
 
 		// The authenticate filter
 		add_filter( 'authenticate', array( $this, 'authenticate' ), 1, 3 );
+
+		// Enforce "Entra ID login only" for users flagged as such. Runs after WordPress'
+		// built-in username/password (priority 20) and application password checks, so it
+		// can veto a successful password authentication.
+		add_filter( 'authenticate', array( $this, 'enforce_entra_only_login' ), 30, 3 );
+
+		// Add the per-user "Entra ID login only" field to the user profile/edit screens.
+		add_action( 'show_user_profile', array( $this, 'render_entra_only_field' ) );
+		add_action( 'edit_user_profile', array( $this, 'render_entra_only_field' ) );
+		add_action( 'personal_options_update', array( $this, 'save_entra_only_field' ) );
+		add_action( 'edit_user_profile_update', array( $this, 'save_entra_only_field' ) );
 
 		// Add the <style> element to the login page
 		add_action( 'login_enqueue_scripts', array( $this, 'print_login_css' ) );
@@ -389,6 +400,95 @@ class AADSSO {
 		return $user;
 	}
 
+	/**
+	 * Blocks non-Entra ID logins (e.g. username/password or application passwords) for users
+	 * that have been flagged as "Microsoft Entra ID login only".
+	 *
+	 * Registered as an 'authenticate' filter at a priority later than WordPress' built-in
+	 * password checks, so that a successful password authentication can still be vetoed here.
+	 *
+	 * @param WP_User|WP_Error|null $user The result of earlier authentication filters.
+	 * @param string $username The username provided during form-based signing. Not used.
+	 * @param string $password The password provided during form-based signing. Not used.
+	 *
+	 * @return WP_User|WP_Error|null The original user, or a WP_Error if access is denied.
+	 */
+	function enforce_entra_only_login( $user, $username, $password ) {
+
+		// Only act when a user has actually been authenticated by an earlier filter.
+		if ( ! is_a( $user, 'WP_User' ) ) {
+			return $user;
+		}
+
+		// If this request is the Microsoft Entra ID authorization response, the user signed
+		// in through Entra ID, so the restriction is satisfied. The presence of 'code' is the
+		// reliable signal that the current request is the Entra ID sign-in callback.
+		if ( isset( $_GET['code'] ) ) {
+			return $user;
+		}
+
+		// If the user is flagged as Entra-only, deny this non-Entra login.
+		if ( '1' === get_user_meta( $user->ID, 'aadsso_entra_only', true ) ) {
+			AADSSO::debug_log( sprintf(
+				'Blocked non-Entra ID login for user [%s] flagged as Entra ID login only.', $user->ID ), 10 );
+			return new WP_Error(
+				'aadsso_entra_only',
+				__( 'ERROR: This account can only sign in using Microsoft Entra ID. '
+					. 'Please use the sign-in link below.', 'aad-sso-wordpress' )
+			);
+		}
+
+		return $user;
+	}
+
+	/**
+	 * Renders the "Microsoft Entra ID login only" checkbox on the user profile/edit screen.
+	 *
+	 * Only shown to administrators (users who can manage options).
+	 *
+	 * @param WP_User $user The user being edited.
+	 */
+	function render_entra_only_field( $user ) {
+
+		if ( ! current_user_can( 'manage_options' ) ) {
+			return;
+		}
+
+		$entra_only = get_user_meta( $user->ID, 'aadsso_entra_only', true );
+		?>
+		<h2><?php esc_html_e( 'Microsoft Entra ID', 'aad-sso-wordpress' ); ?></h2>
+		<table class="form-table" role="presentation">
+			<tr>
+				<th scope="row"><?php esc_html_e( 'Login restriction', 'aad-sso-wordpress' ); ?></th>
+				<td>
+					<label for="aadsso_entra_only">
+						<input type="checkbox" name="aadsso_entra_only" id="aadsso_entra_only" value="1" <?php checked( $entra_only, '1' ); ?> />
+						<?php esc_html_e(
+							'Microsoft Entra ID login only (disables username/password and application password login for this user).',
+							'aad-sso-wordpress'
+						); ?>
+					</label>
+				</td>
+			</tr>
+		</table>
+		<?php
+	}
+
+	/**
+	 * Saves the "Microsoft Entra ID login only" checkbox from the user profile/edit screen.
+	 *
+	 * @param int $user_id The ID of the user being saved.
+	 */
+	function save_entra_only_field( $user_id ) {
+
+		if ( ! current_user_can( 'manage_options' ) ) {
+			return;
+		}
+
+		$value = isset( $_POST['aadsso_entra_only'] ) ? '1' : '';
+		update_user_meta( $user_id, 'aadsso_entra_only', $value );
+	}
+
 	function get_wp_user_from_aad_user( $jwt, $group_memberships ) {
 
 		// Try to find an existing user in WP where the upn or unique_name of the current Microsoft Entra ID user is
@@ -463,6 +563,13 @@ class AADSSO {
 					);
 				} else {
 					AADSSO::debug_log( 'Created new user: \'' . $unique_name . '\', user id ' . $new_user_id . '.' );
+
+					// Users provisioned through Microsoft Entra ID are restricted to Entra ID login
+					// only by default. This makes the restriction explicit and prevents a
+					// password-reset from being used to bypass SSO. Allow it to be overridden.
+					$entra_only = apply_filters( 'aadsso_provisioned_user_entra_only', true, $new_user_id, $jwt );
+					update_user_meta( $new_user_id, 'aadsso_entra_only', $entra_only ? '1' : '' );
+
 					$user = new WP_User( $new_user_id );
 				}
 			} else {
@@ -647,12 +754,13 @@ class AADSSO {
 	 * Renders the link used to initiate the login to Microsoft Entra ID.
 	 */
 	function print_login_link() {
-		$html = '<p class="aadsso-login-form-text">';
-		$html .= '<a href="%s">';
+		$html = '<div class="aadsso-login-form-text">';
+		$html .= '<p class="submit"><a class="aadsso-login-button button button-primary button-large" href="%s">';
 		$html .= sprintf( __( 'Sign in with your %s account', 'aad-sso-wordpress' ),
 		                  htmlentities( $this->settings->org_display_name ) );
-		$html .= '</a><br /><a class="dim" href="%s">'
-		         . __( 'Sign out', 'aad-sso-wordpress' ) . '</a></p>';
+		$html .= '</a></p>';
+		$html .= '<p class="aadsso-signout-text"><a class="dim" href="%s">'
+		         . __( 'Sign out', 'aad-sso-wordpress' ) . '</a></p></div>';
 		printf(
 			$html,
 			$this->get_login_url(),
